@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>hyperstition</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="index,follow">
+<meta name="color-scheme" content="dark">
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{width:100%;height:100%;background:#000;overflow:hidden;color:#d8dae1}
+  body{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+  canvas{display:block;position:fixed;inset:0;width:100%;height:100%;touch-action:none}
+  .contact{
+    position:fixed;left:50%;top:calc(50% + 34vmin);
+    transform:translate(-50%,-50%);
+    font:12px/1 ui-monospace,"SF Mono",Menlo,Consolas,"Roboto Mono",monospace;
+    color:rgba(220,224,232,.42);
+    text-decoration:none;letter-spacing:.06em;
+    padding:8px 12px;border-radius:2px;
+    transition:color .6s ease,opacity .6s ease;
+    will-change:opacity;
+    user-select:all;-webkit-user-select:all;
+  }
+  .contact:hover,.contact:focus-visible{color:rgba(235,238,245,.7);outline:none}
+  @media (max-width:480px){.contact{font-size:11px;top:calc(50% + 36vmin)}}
+  @media (prefers-reduced-motion:reduce){.contact{transition:none}}
+</style>
+</head>
+<body>
+<canvas id="c" aria-hidden="true"></canvas>
+<a class="contact" href="mailto:x@hyperstition.id">x@hyperstition.id</a>
+<script>
+(() => {
+  const forceMotion = /[?&]motion(=|&|$)/.test(location.search);
+  const reducedMotion = !forceMotion && matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const debug = /[?&]debug(=|&|$)/.test(location.search);
+  const diag = { gl: false, vsLog: '', fsLog: '', linkLog: '', fps: 0, lastDrawT: 0, err: '' };
+
+  const canvas = document.getElementById('c');
+  const gl = canvas.getContext('webgl', { antialias: true, alpha: false, premultipliedAlpha: false, powerPreference: 'low-power' })
+          || canvas.getContext('experimental-webgl');
+  diag.gl = !!gl;
+
+  if (debug){
+    const el = document.createElement('pre');
+    el.style.cssText = 'position:fixed;top:8px;left:8px;margin:0;padding:6px 8px;font:11px/1.45 ui-monospace,monospace;color:#7fff9f;background:rgba(0,0,0,.55);border:1px solid rgba(127,255,159,.25);pointer-events:none;z-index:10;white-space:pre;max-width:90vw';
+    document.body.appendChild(el);
+    let last = performance.now(), count = 0;
+    const tick = () => {
+      const now = performance.now();
+      if (now - last >= 500){ diag.fps = Math.round(count * 1000 / (now - last)); count = 0; last = now; }
+      count++;
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+    setInterval(() => {
+      el.textContent = [
+        `gl: ${diag.gl}`,
+        `canvas: ${canvas.width}x${canvas.height} dpr:${(window.devicePixelRatio||1).toFixed(2)}`,
+        `reducedMotion: ${reducedMotion} (forceMotion:${forceMotion})`,
+        `fps: ${diag.fps}  lastDraw: ${(performance.now() - diag.lastDrawT).toFixed(0)}ms ago`,
+        `vs: ${diag.vsLog || 'ok'}`,
+        `fs: ${diag.fsLog || 'ok'}`,
+        `link: ${diag.linkLog || 'ok'}`,
+        `err: ${diag.err || '-'}`,
+        `ua: ${navigator.userAgent.slice(0,80)}`,
+      ].join('\n');
+    }, 200);
+    window.addEventListener('error', (e) => { diag.err = (e.message || String(e.error)).slice(0, 200); });
+  }
+  if (!gl){ if (debug) diag.err = 'WebGL context null'; return; }
+
+  // ---- Shaders ----
+  const VS = `
+    attribute vec2 a;
+    void main(){ gl_Position = vec4(a, 0.0, 1.0); }
+  `;
+  const FS = `
+    precision highp float;
+    uniform vec2 u_res;
+    uniform float u_dpr;
+    uniform vec4 u_edges[32];   // each: (ax, ay, bx, by) in design space
+    uniform vec4 u_ripples[5];  // each: (x, y, age01, strength); age01 >= 1.0 = dead
+    uniform float u_time;
+
+    float segDist(vec2 p, vec2 a, vec2 b){
+      vec2 pa = p - a;
+      vec2 ba = b - a;
+      float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
+      return length(pa - ba * h);
+    }
+
+    void main(){
+      float minD = min(u_res.x, u_res.y);
+      // design space: [-1,1] on shorter axis, aspect-extended on longer
+      vec2 p = (gl_FragCoord.xy - 0.5 * u_res) / (0.5 * minD);
+
+      // accumulate ripple displacement + subtle luminance
+      vec2 disp = vec2(0.0);
+      float glow = 0.0;
+      for (int i = 0; i < 5; i++){
+        vec4 r = u_ripples[i];
+        if (r.z < 1.0){
+          vec2 d = p - r.xy;
+          float dist = length(d);
+          float age = r.z;
+          float fade = (1.0 - age);
+          // space-bending: radial push/pull with a single gentle wavefront
+          vec2 dir = dist > 1e-5 ? d / dist : vec2(0.0);
+          float envelope = exp(-dist * 7.0) * fade;
+          float wave = sin(dist * 13.0 - age * 6.5);
+          disp += dir * wave * envelope * 0.016 * r.w;
+          // very faint gaussian glow at origin so ripples in empty space still register
+          glow += exp(-dist * dist * 260.0) * fade * r.w * 0.16;
+        }
+      }
+
+      vec2 q = p - disp;
+
+      // line SDF across 32 edges
+      float lineSum = 0.0;
+      float pxW = 2.0 * u_dpr / minD; // 1 CSS pixel in design units
+      float halfW = pxW * 0.65;
+      float softW = pxW * 1.2;
+      for (int i = 0; i < 32; i++){
+        vec4 e = u_edges[i];
+        float d = segDist(q, e.xy, e.zw);
+        float line = 1.0 - smoothstep(halfW, softW, d);
+        lineSum = max(lineSum, line);
+      }
+
+      // barely-perceptible breathing so it never looks dead-frozen
+      float breath = 0.96 + 0.04 * sin(u_time * 0.0007);
+
+      vec3 lineColor = vec3(0.90, 0.93, 0.98);
+      vec3 glowColor = vec3(0.62, 0.72, 0.95);
+
+      vec3 col = lineColor * lineSum * 0.58 * breath;
+      col += glowColor * glow;
+
+      // final output: solid black base + additive tesseract + ripple glow
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `;
+
+  function compile(type, src, tag){
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
+      const log = gl.getShaderInfoLog(s) || 'compile failed';
+      console.error(tag, log);
+      if (tag === 'vs') diag.vsLog = log.slice(0, 240);
+      if (tag === 'fs') diag.fsLog = log.slice(0, 240);
+      gl.deleteShader(s);
+      return null;
+    }
+    return s;
+  }
+  const vs = compile(gl.VERTEX_SHADER, VS, 'vs');
+  const fs = compile(gl.FRAGMENT_SHADER, FS, 'fs');
+  if (!vs || !fs){ diag.err = 'shader compile failed'; return; }
+  const prog = gl.createProgram();
+  gl.attachShader(prog, vs);
+  gl.attachShader(prog, fs);
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)){
+    const log = gl.getProgramInfoLog(prog) || 'link failed';
+    console.error('link', log);
+    diag.linkLog = log.slice(0, 240);
+    diag.err = 'link failed';
+    return;
+  }
+  gl.useProgram(prog);
+
+  // fullscreen quad
+  const quad = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+  const aLoc = gl.getAttribLocation(prog, 'a');
+  gl.enableVertexAttribArray(aLoc);
+  gl.vertexAttribPointer(aLoc, 2, gl.FLOAT, false, 0, 0);
+
+  const uRes     = gl.getUniformLocation(prog, 'u_res');
+  const uDpr     = gl.getUniformLocation(prog, 'u_dpr');
+  const uEdges   = gl.getUniformLocation(prog, 'u_edges');
+  const uRipples = gl.getUniformLocation(prog, 'u_ripples');
+  const uTime    = gl.getUniformLocation(prog, 'u_time');
+
+  // ---- Tesseract topology ----
+  const V4 = [];
+  for (let i = 0; i < 16; i++){
+    V4.push([(i&1)?1:-1, (i&2)?1:-1, (i&4)?1:-1, (i&8)?1:-1]);
+  }
+  const EDGES = [];
+  for (let i = 0; i < 16; i++){
+    for (let b = 0; b < 4; b++){
+      const j = i ^ (1 << b);
+      if (j > i) EDGES.push([i, j]);
+    }
+  }
+
+  const verts2D = new Float32Array(32);
+  const edgeBuf = new Float32Array(128);
+  const rippleBuf = new Float32Array(20);
+  for (let i = 0; i < 5; i++) rippleBuf[i*4 + 2] = 2.0; // start dead
+
+  // ---- Projection (4D -> 3D -> 2D with perspective) ----
+  const D4 = 4.5, D3 = 5.0, SCALE = 0.22;
+  // Rotation remains under reduced-motion, just slower. Ripples & ambient effects stay disabled.
+  const rotScale = reducedMotion ? 0.35 : 1.0;
+
+  function projectAll(t){
+    // six independent rotation planes, all slow, coprime-ish rates
+    const k = rotScale;
+    const axw = t * 0.00052 * k + 0.31;
+    const ayw = t * 0.00041 * k + 1.07;
+    const azw = t * 0.00034 * k + 2.44;
+    const axy = t * 0.00022 * k;
+    const axz = t * 0.00027 * k;
+    const ayz = t * 0.00018 * k;
+
+    const cxw = Math.cos(axw), sxw = Math.sin(axw);
+    const cyw = Math.cos(ayw), syw = Math.sin(ayw);
+    const czw = Math.cos(azw), szw = Math.sin(azw);
+    const cxy = Math.cos(axy), sxy = Math.sin(axy);
+    const cxz = Math.cos(axz), sxz = Math.sin(axz);
+    const cyz = Math.cos(ayz), syz = Math.sin(ayz);
+
+    for (let i = 0; i < 16; i++){
+      let x = V4[i][0], y = V4[i][1], z = V4[i][2], w = V4[i][3];
+      let nx, ny, nz, nw;
+      // 4D rotations in xw, yw, zw planes
+      nx = x*cxw - w*sxw; nw = x*sxw + w*cxw; x = nx; w = nw;
+      ny = y*cyw - w*syw; nw = y*syw + w*cyw; y = ny; w = nw;
+      nz = z*czw - w*szw; nw = z*szw + w*czw; z = nz; w = nw;
+      // 4D -> 3D perspective
+      const k4 = D4 / (D4 - w);
+      x *= k4; y *= k4; z *= k4;
+      // 3D rotations
+      nx = x*cxy - y*sxy; ny = x*sxy + y*cxy; x = nx; y = ny;
+      nx = x*cxz - z*sxz; nz = x*sxz + z*cxz; x = nx; z = nz;
+      ny = y*cyz - z*syz; nz = y*syz + z*cyz; y = ny; z = nz;
+      // 3D -> 2D perspective
+      const k3 = D3 / (D3 - z);
+      verts2D[i*2]     = x * k3 * SCALE;
+      verts2D[i*2 + 1] = y * k3 * SCALE;
+    }
+
+    for (let i = 0; i < 32; i++){
+      const a = EDGES[i][0], b = EDGES[i][1];
+      edgeBuf[i*4]     = verts2D[a*2];
+      edgeBuf[i*4 + 1] = verts2D[a*2 + 1];
+      edgeBuf[i*4 + 2] = verts2D[b*2];
+      edgeBuf[i*4 + 3] = verts2D[b*2 + 1];
+    }
+  }
+
+  // ---- Ripple pool ----
+  const ripples = [];
+  for (let i = 0; i < 5; i++) ripples.push({ x:0, y:0, age:2.0, dur:1.0, strength:0 });
+
+  function emitRipple(x, y, strength, durSec){
+    // replace slot with largest (oldest/deadest) age
+    let maxAge = -1, idx = 0;
+    for (let i = 0; i < 5; i++){
+      if (ripples[i].age > maxAge){ maxAge = ripples[i].age; idx = i; }
+    }
+    const r = ripples[idx];
+    r.x = x; r.y = y; r.age = 0; r.dur = durSec; r.strength = strength;
+  }
+
+  // ---- Sizing ----
+  let dpr = 1;
+  function resize(){
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = window.innerWidth, h = window.innerHeight;
+    const cw = Math.max(1, Math.round(w * dpr));
+    const ch = Math.max(1, Math.round(h * dpr));
+    if (canvas.width !== cw || canvas.height !== ch){
+      canvas.width = cw;
+      canvas.height = ch;
+    }
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    gl.viewport(0, 0, cw, ch);
+  }
+
+  // ---- Input ----
+  function clientToDesign(cx, cy){
+    const w = window.innerWidth, h = window.innerHeight;
+    const min = Math.min(w, h);
+    return [ (cx - w * 0.5) / (min * 0.5), -(cy - h * 0.5) / (min * 0.5) ];
+  }
+
+  let lastMoveT = 0, lastMX = -1e9, lastMY = -1e9;
+  if (!reducedMotion){
+    window.addEventListener('pointermove', (e) => {
+      if (e.pointerType === 'touch') return; // taps handle touch
+      const now = performance.now();
+      const dx = e.clientX - lastMX, dy = e.clientY - lastMY;
+      if (now - lastMoveT < 95 || dx*dx + dy*dy < 400) return;
+      lastMoveT = now; lastMX = e.clientX; lastMY = e.clientY;
+      const [x, y] = clientToDesign(e.clientX, e.clientY);
+      emitRipple(x, y, 0.75, 0.95);
+    }, { passive: true });
+
+    window.addEventListener('pointerdown', (e) => {
+      const [x, y] = clientToDesign(e.clientX, e.clientY);
+      emitRipple(x, y, 1.25, 1.25);
+    }, { passive: true });
+  }
+
+  // ---- Main loop ----
+  let running = true;
+  let lastT = performance.now();
+  let nextAmbient = performance.now() + 600 + Math.random() * 700;
+
+  function emitAmbientMaybe(now){
+    if (reducedMotion) return;
+    if (now < nextAmbient) return;
+    const aspect = window.innerWidth / window.innerHeight;
+    const rx = (Math.random() * 2 - 1) * (aspect > 1 ? aspect : 1);
+    const ry = (Math.random() * 2 - 1) * (aspect < 1 ? 1/aspect : 1);
+    emitRipple(rx * 0.88, ry * 0.88, 0.45 + Math.random() * 0.4, 1.1 + Math.random() * 0.7);
+    nextAmbient = now + 3000 + Math.random() * 5000;
+  }
+
+  function draw(timeForTesseract){
+    projectAll(timeForTesseract);
+    for (let i = 0; i < 5; i++){
+      const r = ripples[i];
+      rippleBuf[i*4]     = r.x;
+      rippleBuf[i*4 + 1] = r.y;
+      rippleBuf[i*4 + 2] = r.age;
+      rippleBuf[i*4 + 3] = r.strength;
+    }
+    gl.uniform2f(uRes, canvas.width, canvas.height);
+    gl.uniform1f(uDpr, dpr);
+    gl.uniform1f(uTime, timeForTesseract);
+    gl.uniform4fv(uEdges, edgeBuf);
+    gl.uniform4fv(uRipples, rippleBuf);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    diag.lastDrawT = performance.now();
+  }
+
+  function frame(now){
+    if (!running) return;
+    const dt = Math.min(100, now - lastT);
+    lastT = now;
+
+    for (let i = 0; i < 5; i++){
+      const r = ripples[i];
+      if (r.age < 1) r.age += dt / (1000 * r.dur);
+    }
+    emitAmbientMaybe(now);
+    draw(now);
+    requestAnimationFrame(frame);
+  }
+
+  // visibility: pause raf when hidden
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible'){
+      if (!running){
+        running = true;
+        lastT = performance.now();
+        nextAmbient = lastT + 1500 + Math.random() * 2000;
+        requestAnimationFrame(frame);
+      }
+    } else {
+      running = false;
+    }
+  });
+
+  // context loss safety
+  canvas.addEventListener('webglcontextlost', (e) => { e.preventDefault(); running = false; });
+
+  window.addEventListener('resize', resize, { passive: true });
+  resize();
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
