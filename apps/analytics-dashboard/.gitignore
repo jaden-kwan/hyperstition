@@ -1,0 +1,32 @@
+# env
+.env
+.env.local
+
+# python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# node
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+
+# data — never commit scraped or coded data
+pipeline/data/raw/
+pipeline/data/coded/
+pipeline/data/posts.db
+pipeline/data/posts.db-journal
+pipeline/data/posts.db-wal
+pipeline/data/posts.db-shm
+
+# os
+.DS_Store
